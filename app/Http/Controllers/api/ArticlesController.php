@@ -6,41 +6,98 @@ use App\Models\Articles;
 use App\Models\User;
 use Illuminate\Http\Request;
 use Illuminate\Support\Facades\DB;
+use Illuminate\Support\Facades\Validator;
 use Illuminate\Support\Str;
 
 class ArticlesController extends Controller
 {
-    public function index(Request $request)
+    public function index(Request $request): \Illuminate\Http\JsonResponse
     {
+        // ===== STEP 1: Validate & Sanitize Query Parameters =====
+        $validator = Validator::make($request->query(), [
+            'limit'  => 'nullable|integer|min:1|max:100',
+            'author' => 'nullable|integer|exists:users,id',
+            'cursor' => 'nullable|string', // Encoded cursor from previous response
+        ]);
 
-        $limit  = $request->query('limit'); // Retrieves the 'author' query parameter
-        $author = $request->query('author');
+        if ($validator->fails()) {
+            return response()->json([
+                'errors' => $validator->errors()
+            ], 422);
+        }
 
-        $userId = auth()->id(); // Get the authenticated user's ID
+        $validated = $validator->validated();
 
-        $articles = Articles::with(['user', 'favoritedByUsers' => function ($query) use ($userId) {
-            $query->where('user_id', $userId);
-        }])
+        // ===== STEP 2: Set Defaults & Enforce Max Limit =====
+        $perPage = min($validated['limit'] ?? 10, 100); // Default: 10, Max: 100
+        $authorFilter = $validated['author'] ?? null;
+        $cursor = $validated['cursor'] ?? null;
+
+        // IMPORTANT: When filters change (e.g., different author), the frontend MUST
+        // reset the cursor to null to avoid incorrect pagination boundaries.
+        // Store filter state in frontend and compare before using cached cursor.
+
+        // ===== STEP 3: Build Query with Deterministic Ordering =====
+        $userId = auth()->id(); // Current authenticated user (null if guest)
+
+        $query = Articles::query()
+            // Eager load user relationship
+            ->with(['user'])
+            // Eager load favoritedByUsers ONLY for current auth user (reduces payload)
+            ->with(['favoritedByUsers' => function ($query) use ($userId) {
+                if ($userId) {
+                    $query->where('user_id', $userId);
+                }
+            }])
+            // Count total favorites for each article
             ->withCount('favoritedByUsers')
-            ->when($author, function ($q) use ($author) {
-                return $q->where('user_id', $author);
+            // Filter by author if provided
+            ->when($authorFilter, function ($q) use ($authorFilter) {
+                return $q->where('user_id', $authorFilter);
             })
-            ->paginate($limit);
+            // CRITICAL: Deterministic ordering prevents duplicates/skipped items
+            // Primary: created_at DESC (most recent first)
+            // Tie-breaker: id DESC (ensures uniqueness when created_at is identical)
+            ->orderByDesc('created_at')
+            ->orderByDesc('id');
 
-        //  Add a custom attribute to indicate if the authenticated user has favorited the article
-        $articles->getCollection()->transform(function ($article) use ($userId) {
-            $article->is_favorited_by_auth_user = $article->favoritedByUsers->isNotEmpty();
+        // ===== STEP 4: Execute Cursor Pagination =====
+        // cursorPaginate uses the ordering columns to create an encoded cursor
+        $paginator = $query->cursorPaginate($perPage);
 
-            // Assuming the image path is stored in `$article->profile_image`
-            if ($article->user->image) {
-                $article->user->profile_image_url = url($article->user->image); // Dynamically generate the full URL
+        // ===== STEP 5: Transform Each Article =====
+        $transformedArticles = $paginator->getCollection()->map(function ($article) use ($userId) {
+            // Check if auth user has favorited this article
+            $article->is_favorited_by_auth_user = $userId 
+                ? $article->favoritedByUsers->isNotEmpty() 
+                : false;
+
+            // Generate full URL for user profile image
+            if ($article->user && $article->user->image) {
+                $article->user->profile_image_url = url($article->user->image);
             }
+
+            // CLEANUP: Remove the favoritedByUsers relation to reduce JSON payload
+            // (we already computed is_favorited_by_auth_user above)
+            unset($article->favoritedByUsers);
 
             return $article;
         });
 
-        // Use the parameters as needed
-        return response()->json($articles);
+        // ===== STEP 6: Build Response with Cursor Metadata =====
+        // Extract cursor strings (Laravel encodes them automatically)
+        $nextCursor = $paginator->nextCursor()?->encode(); // null if no more pages
+        $prevCursor = $paginator->previousCursor()?->encode(); // null if on first page
+
+        return response()->json([
+            'data' => $transformedArticles->toArray(), // Plain array, not Eloquent models
+            'meta' => [
+                'per_page'    => $paginator->perPage(),
+                'has_more'    => $paginator->hasMorePages(), // Boolean: are there more results?
+                'next_cursor' => $nextCursor, // Encoded string or null
+                'prev_cursor' => $prevCursor, // Encoded string or null
+            ],
+        ]);
     }
 
     public function feed(Request $request)
