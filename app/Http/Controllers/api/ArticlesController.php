@@ -168,8 +168,9 @@ class ArticlesController extends Controller
         ])->validate();
 
         // Update the slug if the title is present
+        // PASS $article->id to exclude it from duplicate check
         if (isset($validatedData['title'])) {
-            $validatedData['slug'] = $this->generateUniqueSlug($validatedData['title']);
+            $validatedData['slug'] = $this->generateUniqueSlug($validatedData['title'], $article->id);
         }
 
         $article->update($validatedData);
@@ -251,19 +252,31 @@ class ArticlesController extends Controller
         }
     }
 
-    public function generateUniqueSlug($title)
+    public function generateUniqueSlug($title, $articleId = null)
     {
         // Generate the initial slug
         $slug = Str::slug($title);
 
-                                      // Append a random unique identifier
-        $randomId   = Str::random(8); // Generates an 8-character random string
+        // Append a random unique identifier
+        $randomId   = Str::random(8);
         $uniqueSlug = "{$slug}-{$randomId}";
 
-        // Ensure the slug is unique in the database
-        while (Articles::where('slug', $uniqueSlug)->exists()) {
+        // Ensure the slug is unique in the database (excluding current article)
+        $query = Articles::where('slug', $uniqueSlug);
+        
+        if ($articleId) {
+            $query->where('id', '!=', $articleId);
+        }
+        
+        while ($query->exists()) {
             $randomId   = Str::random(8); // Regenerate if duplicate
             $uniqueSlug = "{$slug}-{$randomId}";
+            
+            // Reset query for next iteration
+            $query = Articles::where('slug', $uniqueSlug);
+            if ($articleId) {
+                $query->where('id', '!=', $articleId);
+            }
         }
 
         return $uniqueSlug;
