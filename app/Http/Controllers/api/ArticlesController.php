@@ -262,23 +262,43 @@ class ArticlesController extends Controller
             ],
         ]);
     }
-
+    
     public function show(string $slug)
     {
+        $userId = auth()->id(); // Current authenticated user (null if guest)
 
-        // Find the article by slug
-        $article = Articles::with('user')->where('slug', $slug)->first();
+        // Find the article by slug with relationships and favorite count
+        $article = Articles::query()
+            ->with(['user'])
+            // Eager load favoritedByUsers ONLY for current auth user
+            ->with(['favoritedByUsers' => function ($query) use ($userId) {
+                if ($userId) {
+                    $query->where('user_id', $userId);
+                }
+            }])
+            // Count total favorites for this article
+            ->withCount('favoritedByUsers')
+            ->where('slug', $slug)
+            ->first();
 
-        if ($article->user->image) {
-            $article->user->profile_image_url = url($article->user->image); // Dynamically generate the full URL
-        }
-
-        if (! $article) {
+        if (!$article) {
             return response()->json(['message' => 'Article not found'], 404);
         }
 
-        return response()->json($article);
+        // Check if auth user has favorited this article
+        $article->is_favorited_by_auth_user = $userId 
+            ? $article->favoritedByUsers->isNotEmpty() 
+            : false;
 
+        // Generate full URL for user profile image
+        if ($article->user && $article->user->image) {
+            $article->user->profile_image_url = url($article->user->image);
+        }
+
+        // Remove the favoritedByUsers relation to reduce JSON payload
+        unset($article->favoritedByUsers);
+
+        return response()->json($article);
     }
 
     public function store(Request $request)
